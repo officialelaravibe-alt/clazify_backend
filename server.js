@@ -1,4 +1,8 @@
 require('dotenv').config();
+const dns = require('dns');
+if (dns.setDefaultResultOrder) {
+  dns.setDefaultResultOrder('ipv4first');
+}
 const express = require('express');
 const cors = require('cors');
 const { Pool } = require('pg');
@@ -347,6 +351,135 @@ app.get('/api/attendance', async (req, res) => {
   } catch (err) {
     console.error('Error fetching attendance records:', err);
     res.status(500).json({ error: 'Database error fetching attendance' });
+  }
+});
+
+// Ensure adjustments table exists in PostgreSQL
+pool.query(`
+  CREATE TABLE IF NOT EXISTS adjustments (
+    id VARCHAR(100) PRIMARY KEY,
+    date VARCHAR(50) NOT NULL,
+    day_of_week VARCHAR(10),
+    absent_trainer VARCHAR(100) NOT NULL,
+    assigned_to VARCHAR(100) NOT NULL,
+    class_name VARCHAR(100) NOT NULL,
+    course_code VARCHAR(100),
+    venue VARCHAR(100),
+    slot_label VARCHAR(50),
+    time_schedule VARCHAR(50),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );
+`).catch(err => console.error("Error creating adjustments table:", err.message));
+
+// Helper: Normalize trainer name for matching (e.g. "Ms Aparna Sharma" -> "aparna")
+function extractFirstName(name) {
+  if (!name) return "";
+  return name.replace(/^(Mr\.|Mr|Ms\.|Ms|Dr\.|Dr|Prof\.|Prof)\s*/i, '').trim().split(' ')[0].toLowerCase();
+}
+
+// Endpoint: Sync Adjustments from Manager Desktop App & Fire FCM Push Notifications
+app.post('/api/adjustments', async (req, res) => {
+  const { planId, date, dayOfWeek, adjustments } = req.body;
+  if (!adjustments || !Array.isArray(adjustments)) {
+    return res.status(400).json({ error: 'Missing adjustments array' });
+  }
+
+  try {
+    const results = [];
+    for (const item of adjustments) {
+      const id = item.id || `${date}_${item.assignedTo || item.assigned_to}_${item.slotLabel || item.slot_label || 'slot'}_${Date.now()}`;
+      const absentTrainer = item.absentTrainer || item.absent_trainer || 'Faculty';
+      const assignedTo = item.assignedTo || item.assigned_to || '';
+      const className = item.className || item.class_name || '';
+      const courseCode = item.courseCode || item.course_code || '';
+      const venue = item.venue || '';
+      const slotLabel = item.slotLabel || item.slot_label || '';
+      const timeSchedule = item.timeSchedule || item.time_schedule || '';
+      const day = dayOfWeek || item.day_of_week || '';
+
+      // Upsert into adjustments table
+      const upsertQuery = `
+        INSERT INTO adjustments (id, date, day_of_week, absent_trainer, assigned_to, class_name, course_code, venue, slot_label, time_schedule)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        ON CONFLICT (id) DO UPDATE SET
+          absent_trainer = EXCLUDED.absent_trainer,
+          assigned_to = EXCLUDED.assigned_to,
+          class_name = EXCLUDED.class_name,
+          course_code = EXCLUDED.course_code,
+          venue = EXCLUDED.venue,
+          slot_label = EXCLUDED.slot_label,
+          time_schedule = EXCLUDED.time_schedule;
+      `;
+      await pool.query(upsertQuery, [id, date, day, absentTrainer, assignedTo, className, courseCode, venue, slotLabel, timeSchedule]);
+
+      // Find recipient trainer's FCM token from users table
+      if (assignedTo && assignedTo !== 'Unassigned') {
+        const firstName = extractFirstName(assignedTo);
+        const userQuery = `
+          SELECT id, name, fcm_token FROM users 
+          WHERE LOWER(name) LIKE $1 OR LOWER(name) LIKE $2
+          LIMIT 1;
+        `;
+        const userRes = await pool.query(userQuery, [`%${firstName}%`, `%${assignedTo.toLowerCase()}%`]);
+        const recipient = userRes.rows[0];
+
+        if (recipient && recipient.fcm_token) {
+          const pushTitle = '🚨 Proxy Lecture Assigned!';
+          const pushBody = `For ${absentTrainer}: ${className} (${courseCode}) at ${venue} • Slot ${slotLabel} (${timeSchedule})`;
+          
+          await sendPushNotification(
+            recipient.fcm_token,
+            pushTitle,
+            pushBody,
+            {
+              type: 'ADJUSTMENT',
+              id: String(id),
+              date: String(date),
+              dayOfWeek: String(day),
+              absentTrainer: String(absentTrainer),
+              assignedTo: String(assignedTo),
+              className: String(className),
+              courseCode: String(courseCode),
+              venue: String(venue),
+              slotLabel: String(slotLabel),
+              timeSchedule: String(timeSchedule)
+            }
+          );
+          results.push({ id, assignedTo, notified: true });
+        } else {
+          results.push({ id, assignedTo, notified: false, reason: 'FCM token not registered yet' });
+        }
+      }
+    }
+
+    res.json({ success: true, count: adjustments.length, results });
+  } catch (err) {
+    console.error('Error syncing adjustments:', err);
+    res.status(500).json({ error: 'Database error syncing adjustments', details: err.message });
+  }
+});
+
+// Endpoint: Get Adjustments for a Trainer
+app.get('/api/adjustments', async (req, res) => {
+  const { trainer, date } = req.query;
+  try {
+    let query = 'SELECT * FROM adjustments WHERE 1=1';
+    const params = [];
+    if (trainer) {
+      const firstName = extractFirstName(trainer);
+      params.push(`%${firstName}%`);
+      query += ` AND LOWER(assigned_to) LIKE $${params.length}`;
+    }
+    if (date) {
+      params.push(date);
+      query += ` AND date = $${params.length}`;
+    }
+    query += ' ORDER BY created_at DESC LIMIT 50';
+    const result = await pool.query(query, params);
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Error fetching adjustments:', err);
+    res.status(500).json({ error: 'Database error fetching adjustments' });
   }
 });
 

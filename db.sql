@@ -72,3 +72,18 @@ CREATE TABLE IF NOT EXISTS attendance_records (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(subject_code, batch_section, date)
 );
+
+-- Adjustments table (synced from Manager Desktop Application)
+CREATE TABLE IF NOT EXISTS adjustments (
+    id VARCHAR(100) PRIMARY KEY,
+    date VARCHAR(50) NOT NULL,
+    day_of_week VARCHAR(10),
+    absent_trainer VARCHAR(100) NOT NULL,
+    assigned_to VARCHAR(100) NOT NULL,
+    class_name VARCHAR(100) NOT NULL,
+    course_code VARCHAR(100),
+    venue VARCHAR(100),
+    slot_label VARCHAR(50),
+    time_schedule VARCHAR(50),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
