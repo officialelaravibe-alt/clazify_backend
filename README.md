@@ -28,8 +28,8 @@ The server checks the Google ID token (signature, expiry, client ID, verified em
 ## Lecture adjustments
 
 1. LAS sends the **whole plan for one date** to `POST /api/adjustments`.
-2. Each item carries `assignedEmail` (from the LAS team list) and is matched to that trainer exactly.
-   Without an email the name is used, only when it fits exactly one trainer. Not signed in yet = listed under `unmatched`.
+2. Each item carries `assignedEmail` (from the LAS team list) and goes ONLY to the trainer signed in with that email.
+   No email in the team list, or that trainer has not signed in yet = listed under `unmatched`. With an email, the lecture is kept and reaches that trainer as soon as they sign in.
 3. New or changed lectures → data-only push `ADJUSTMENT` to that trainer.
    Lectures removed from the plan (or moved to someone else) → push `ADJUSTMENT_CANCELLED`.
    Sending the same plan again sends nothing.

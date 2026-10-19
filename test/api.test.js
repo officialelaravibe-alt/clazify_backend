@@ -194,6 +194,8 @@ describe('MANAGER_EMAILS is the final word', () => {
     const role = await pool.query("SELECT role FROM team_members WHERE email = 'tester.dev@cqst.in'");
     assert.equal(role.rows[0].role, 'TRAINER');
     await pool.query("DELETE FROM team_members WHERE email = 'tester.dev@cqst.in'");
+    // the list-based app above demoted the first manager in this shared test database: restore it
+    await pool.query("UPDATE team_members SET role = 'MANAGER' WHERE email = 'sandeep.rana@codequotient.com'");
     await pool.query("DELETE FROM sessions WHERE email = 'tester.dev@cqst.in'");
   });
 });
@@ -327,11 +329,13 @@ describe('adjustments: LAS -> phone', () => {
     assert.ok(sent.some((s) => s.token === 'fcm-baljeet' && s.data.type === 'ADJUSTMENT_CANCELLED'));
     assert.ok(sent.some((s) => s.token === 'fcm-aparna' && s.data.type === 'ADJUSTMENT'));
   });
-  test('name-only items still match when the name fits exactly one trainer', async () => {
+  test('an item without an email reaches nobody, even when the name fits', async () => {
     sent.length = 0;
-    await post(plan([item({ id: `${today}_Ms Aparna Sharma_1`, assignedTo: 'Ms Aparna Sharma', assignedEmail: undefined })]));
+    const r = await post(plan([item({ id: `${today}_Ms Aparna Sharma_1`, assignedTo: 'Ms Aparna Sharma', assignedEmail: undefined })]));
+    assert.deepEqual(r.body.unmatched, ['Ms Aparna Sharma']);
+    assert.ok(!sent.some((s) => s.data.type === 'ADJUSTMENT'));
     const mine = await request(app).get('/api/adjustments/mine').set(auth(T.aparna));
-    assert.equal(mine.body.adjustments.length, 1);
+    assert.equal(mine.body.adjustments.length, 0);
   });
   test('bad input is refused', async () => {
     for (const body of [

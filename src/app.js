@@ -5,7 +5,7 @@ const express = require('express');
 const helmet = require('helmet');
 const { rateLimit } = require('express-rate-limit');
 
-const { nameKey, matchUser } = require('./names');
+const { nameKey } = require('./names');
 const { sha256Hex, newDeviceToken, bearerToken, logError } = require('./security');
 const { BadRequest, str, int, isoDate, todayIn, addDays, daysBetween } = require('./util');
 
@@ -767,22 +767,22 @@ keep student data confidential, and do not share your account. Access can be rem
     return r.rows;
   }
 
-  // Email from LAS first (exact), then the name (only when it fits exactly one trainer).
-  function pickRecipient(assignedEmail, assignedTo, users) {
-    if (assignedEmail) return users.find((u) => u.email === assignedEmail) || null;
-    return matchUser(assignedTo, users);
+  // Lectures go ONLY by the email from the LAS team list. No email = nobody gets it.
+  function pickRecipient(assignedEmail, users) {
+    if (!assignedEmail) return null;
+    return users.find((u) => u.email === assignedEmail) || null;
   }
 
   async function linkPendingAdjustments() {
     const today = todayIn(cfg.timeZone);
     const pending = await db.query(
-      'SELECT id, assigned_to, assigned_email FROM adjustments WHERE user_id IS NULL AND date >= $1',
+      'SELECT id, assigned_email FROM adjustments WHERE user_id IS NULL AND assigned_email IS NOT NULL AND date >= $1',
       [addDays(today, -1)]
     );
     if (!pending.rows.length) return;
     const users = await recipients();
     for (const row of pending.rows) {
-      const u = pickRecipient(row.assigned_email, row.assigned_to, users);
+      const u = pickRecipient(row.assigned_email, users);
       if (u) await db.query('UPDATE adjustments SET user_id = $1 WHERE id = $2', [u.id, row.id]);
     }
   }
@@ -817,7 +817,7 @@ keep student data confidential, and do not share your account. Access can be rem
         seen.add(id);
         const assignedEmail = normEmail(item.assignedEmail ?? item.assigned_email);
         if (assignedEmail && !emailAllowed(assignedEmail)) throw new BadRequest('assignedEmail must be a work email');
-        const user = pickRecipient(assignedEmail, assignedTo, users);
+        const user = pickRecipient(assignedEmail, users);
         incoming.push({
           id,
           date,
@@ -916,9 +916,9 @@ keep student data confidential, and do not share your account. Access can be rem
       if (span < 0 || span > 31) throw new BadRequest('Date range must be 0-31 days');
       const r = await db.query(
         `SELECT * FROM adjustments WHERE date >= $1 AND date <= $2
-           AND (user_id = $3 OR (user_id IS NULL AND (assigned_email = $5 OR (assigned_email IS NULL AND assigned_key = $4))))
+           AND (user_id = $3 OR (user_id IS NULL AND assigned_email = $4))
          ORDER BY date ASC, slot_label ASC`,
-        [from, to, req.user.id, req.user.name_key, (req.user.email || '').toLowerCase()]
+        [from, to, req.user.id, (req.user.email || '').toLowerCase()]
       );
       res.json({ from, to, adjustments: r.rows.map(adjustmentPayload) });
     })
