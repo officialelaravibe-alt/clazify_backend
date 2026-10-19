@@ -1,6 +1,6 @@
 {
   "name": "clazify-backend",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Clazify backend: secure API between the Clazify Android app, the LAS desktop app and Google Apps Script",
   "main": "server.js",
   "scripts": {
