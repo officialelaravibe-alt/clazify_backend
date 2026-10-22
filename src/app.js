@@ -8,6 +8,7 @@ const { rateLimit } = require('express-rate-limit');
 const { nameKey } = require('./names');
 const { sha256Hex, newDeviceToken, bearerToken, logError } = require('./security');
 const { BadRequest, str, int, isoDate, todayIn, addDays, daysBetween } = require('./util');
+const { createTimetableSync, lectureVersion } = require('./timetableSync');
 
 const TEAM_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{1,49}$/;
 const ID_RE = /^[A-Za-z0-9][A-Za-z0-9_.:@ -]{0,99}$/;
@@ -43,6 +44,7 @@ function createApp({ db, push, config, fetch: fetchImpl = globalThis.fetch, veri
     driveKey: config.driveKey || '',
     driveFolderId: config.driveFolderId || '',
     rateLimits: config.rateLimits !== false,
+    autoTimetable: config.autoTimetable !== false, // re-read the timetable after team changes
   };
 
   const app = express();
@@ -469,6 +471,7 @@ keep student data confidential, and do not share your account. Access can be rem
           });
         }
       }
+      refreshTimetableSoon();
       res.json({ success: true, members: await teamView(), removed, rejected });
     })
   );
@@ -967,18 +970,67 @@ keep student data confidential, and do not share your account. Access can be rem
 
   // ---------- timetable PDFs from the shared Google Drive folder (key stays on the server) ----------
 
+  const driveConfigured = () => !!(cfg.driveKey && cfg.driveFolderId);
+
   async function driveList() {
     const q = `'${cfg.driveFolderId}' in parents and mimeType = 'application/pdf' and trashed = false`;
     const url =
       `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(q)}` +
-      `&orderBy=createdTime%20desc&pageSize=50&fields=files(id,name,mimeType)&key=${encodeURIComponent(cfg.driveKey)}`;
+      `&orderBy=createdTime%20desc&pageSize=50&fields=files(id,name,mimeType,modifiedTime,createdTime)` +
+      `&key=${encodeURIComponent(cfg.driveKey)}`;
     const r = await fetchImpl(url, { redirect: 'error', signal: AbortSignal.timeout(20000) });
     if (!r.ok) {
       console.error(`[drive] list answered HTTP ${r.status}`);
       return null;
     }
     const data = await r.json();
-    return (data.files || []).map((f) => ({ id: f.id, name: f.name, mimeType: f.mimeType || 'application/pdf' }));
+    return (data.files || [])
+      .filter((f) => f && typeof f.id === 'string' && DRIVE_ID_RE.test(f.id))
+      .map((f) => ({
+        id: f.id,
+        name: String(f.name || ''),
+        mimeType: f.mimeType || 'application/pdf',
+        modifiedTime: String(f.modifiedTime || ''),
+        createdTime: String(f.createdTime || ''),
+      }));
+  }
+
+  /** Downloads one file of the folder and checks that it is a PDF of a sane size. */
+  async function driveDownload(fileId) {
+    const r = await fetchImpl(
+      `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&key=${encodeURIComponent(cfg.driveKey)}`,
+      { redirect: 'follow', signal: AbortSignal.timeout(60000) }
+    );
+    if (!r.ok) throw Object.assign(new Error(`drive download HTTP ${r.status}`), { status: 502, publicMessage: 'Google Drive unavailable' });
+    const len = Number(r.headers && r.headers.get ? r.headers.get('content-length') : 0);
+    if (len > MAX_PDF_BYTES) throw Object.assign(new Error('pdf too large'), { status: 413, publicMessage: 'File too large' });
+    const buf = Buffer.from(await r.arrayBuffer());
+    if (buf.length > MAX_PDF_BYTES) throw Object.assign(new Error('pdf too large'), { status: 413, publicMessage: 'File too large' });
+    if (buf.subarray(0, 5).toString('latin1') !== '%PDF-') throw Object.assign(new Error('not a pdf'), { status: 415, publicMessage: 'Not a PDF' });
+    return buf;
+  }
+
+  // After a new timetable is saved: tell only the trainers whose own lectures changed.
+  // Data-only push; the app then asks GET /api/timetable/mine and updates its local copy.
+  async function notifyTimetableChanged({ changedEmails, firstTimetable }) {
+    const emails = changedEmails.map((e) => String(e).toLowerCase());
+    if (!emails.length) return;
+    const r = await db.query('SELECT id, email, fcm_token FROM users WHERE LOWER(email) = ANY($1::text[])', [emails]);
+    for (const u of r.rows) {
+      await pushTo(u, {
+        type: 'TIMETABLE_UPDATED',
+        title: 'New timetable',
+        body: firstTimetable ? 'Your timetable is ready in Clazify.' : 'Your timetable has changed. Clazify has the new one.',
+      });
+    }
+  }
+
+  const timetableSync = createTimetableSync({ db, driveList, driveDownload, onUpdated: notifyTimetableChanged });
+  app.locals.timetableSync = timetableSync;
+
+  // Called after the LAS team list changes: the new member's page may now be needed.
+  function refreshTimetableSoon() {
+    if (cfg.autoTimetable && driveConfigured()) timetableSync.refresh().catch(() => {});
   }
 
   app.get(
@@ -986,10 +1038,10 @@ keep student data confidential, and do not share your account. Access can be rem
     requireDevice,
     limiter(10 * 60 * 1000, 60, (req) => `drive:${req.user.id}`),
     wrap(async (req, res) => {
-      if (!cfg.driveKey || !cfg.driveFolderId) return res.status(503).json({ error: 'Timetable folder is not configured' });
+      if (!driveConfigured()) return res.status(503).json({ error: 'Timetable folder is not configured' });
       const files = await driveList();
       if (!files) return res.status(502).json({ error: 'Google Drive unavailable' });
-      res.json({ files });
+      res.json({ files: files.map(({ id, name, mimeType }) => ({ id, name, mimeType })) });
     })
   );
 
@@ -998,25 +1050,121 @@ keep student data confidential, and do not share your account. Access can be rem
     requireDevice,
     limiter(10 * 60 * 1000, 30, (req) => `drivefile:${req.user.id}`),
     wrap(async (req, res) => {
-      if (!cfg.driveKey || !cfg.driveFolderId) return res.status(503).json({ error: 'Timetable folder is not configured' });
+      if (!driveConfigured()) return res.status(503).json({ error: 'Timetable folder is not configured' });
       const fileId = req.params.fileId;
       if (!DRIVE_ID_RE.test(fileId)) throw new BadRequest('Invalid file id');
       // Only files that are inside the configured folder can be downloaded.
       const files = await driveList();
       if (!files) return res.status(502).json({ error: 'Google Drive unavailable' });
       if (!files.some((f) => f.id === fileId)) return res.status(404).json({ error: 'File not found' });
-
-      const r = await fetchImpl(
-        `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&key=${encodeURIComponent(cfg.driveKey)}`,
-        { redirect: 'follow', signal: AbortSignal.timeout(60000) }
-      );
-      if (!r.ok) return res.status(502).json({ error: 'Google Drive unavailable' });
-      const buf = Buffer.from(await r.arrayBuffer());
-      if (buf.length > MAX_PDF_BYTES) return res.status(413).json({ error: 'File too large' });
-      if (buf.subarray(0, 5).toString('latin1') !== '%PDF-') return res.status(415).json({ error: 'Not a PDF' });
+      let buf;
+      try {
+        buf = await driveDownload(fileId);
+      } catch (err) {
+        return res.status(err.status || 502).json({ error: err.publicMessage || 'Google Drive unavailable' });
+      }
       res.set('Content-Type', 'application/pdf');
       res.set('Content-Disposition', 'attachment');
       res.send(buf);
+    })
+  );
+
+  /**
+   * Public "check now" ping for an outside scheduler (cron-job.org).
+   * Takes no input and returns no data: it only asks the server to look for a new PDF.
+   * The work runs in the background, so the scheduler gets an answer at once.
+   */
+  app.post(
+    '/api/timetable/refresh',
+    limiter(60 * 60 * 1000, 30, () => 'timetable-ping'),
+    (req, res) => {
+      if (!driveConfigured()) return res.status(503).json({ status: 'not-configured' });
+      res.status(202).json({ status: timetableSync.ping() });
+    }
+  );
+
+  function timetableMeta(row) {
+    if (!row) return null;
+    return {
+      id: row.id,
+      fileName: row.file_name || '',
+      effectiveFrom: row.effective_from || '',
+      generatedOn: row.generated_on || '',
+      pages: row.page_count || 0,
+      parsedAt: row.parsed_at,
+    };
+  }
+
+  const lectureView = (e) => ({
+    day: e.day_of_week,
+    slots: e.slots,
+    courseCode: e.course_code || '',
+    venue: e.venue || '',
+    className: e.class_name || '',
+  });
+
+  // LAS: check Drive now and wait for the result.
+  app.post(
+    '/api/las/timetable/refresh',
+    requireManager,
+    limiter(10 * 60 * 1000, 20, (req) => `ttrefresh:${req.manager.email}`),
+    wrap(async (req, res) => {
+      if (!driveConfigured()) return res.status(503).json({ error: 'Timetable folder is not configured' });
+      const force = !!(req.body && req.body.force === true);
+      let r;
+      try {
+        r = await timetableSync.refresh({ force });
+      } catch (err) {
+        return res.status(502).json({ error: err.publicMessage || 'Timetable could not be read' });
+      }
+      res.json(r);
+    })
+  );
+
+  // LAS: the whole team timetable (only team members' pages).
+  app.get(
+    '/api/las/timetable',
+    requireManager,
+    wrap(async (req, res) => {
+      const row = await timetableSync.activeRow();
+      if (!row) return res.json({ timetable: null, teachers: [], unmatched: [], lectures: [], sync: timetableSync.status() });
+      const r = await db.query(
+        `SELECT email, teacher_name, day_of_week, slots, course_code, venue, class_name
+         FROM timetable_entries WHERE timetable_id = $1 ORDER BY id`,
+        [row.id]
+      );
+      res.json({
+        timetable: timetableMeta(row),
+        teachers: Array.isArray(row.teacher_names) ? row.teacher_names : [],
+        unmatched: Array.isArray(row.unmatched) ? row.unmatched : [],
+        lectures: r.rows.map((e) => ({ email: e.email, teacher: e.teacher_name, ...lectureView(e) })),
+        sync: timetableSync.status(),
+      });
+    })
+  );
+
+  // Clazify app: the signed-in trainer's own lectures.
+  app.get(
+    '/api/timetable/mine',
+    requireDevice,
+    wrap(async (req, res) => {
+      // ?known=<version the phone already has>. Same version = "unchanged", nothing else is sent,
+      // so the phone keeps using its local copy. Anything that is not a version is ignored.
+      const known = typeof req.query.known === 'string' && /^[0-9a-f]{32}$/.test(req.query.known) ? req.query.known : '';
+      const row = await timetableSync.activeRow();
+      if (!row) {
+        const version = lectureVersion(null, []);
+        if (known === version) return res.json({ changed: false, version });
+        return res.json({ changed: true, version, timetable: null, lectures: [] });
+      }
+      const r = await db.query(
+        `SELECT day_of_week, slots, course_code, venue, class_name FROM timetable_entries
+         WHERE timetable_id = $1 AND email = $2 ORDER BY id`,
+        [row.id, String(req.user.email || '').toLowerCase()]
+      );
+      const version = lectureVersion(row, r.rows);
+      if (known === version) return res.json({ changed: false, version });
+      res.json({ changed: true, version, timetable: timetableMeta(row), lectures: r.rows.map(lectureView) });
     })
   );
 

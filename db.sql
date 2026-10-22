@@ -108,3 +108,33 @@ CREATE TABLE IF NOT EXISTS sessions (
     created_at TIMESTAMPTZ DEFAULT NOW(),
     last_used_at TIMESTAMPTZ DEFAULT NOW()
 );
+
+-- Timetable read by the server from the newest PDF in the Drive folder.
+-- Only the pages of LAS team members are parsed; LAS and the app read it from here.
+CREATE TABLE IF NOT EXISTS timetables (
+    id SERIAL PRIMARY KEY,
+    drive_file_id VARCHAR(100) NOT NULL,
+    file_name VARCHAR(255),
+    drive_modified VARCHAR(40),            -- Drive modifiedTime; a new value means a new upload
+    effective_from VARCHAR(20),            -- from the file name (dd.mm.yyyy), may be empty
+    generated_on VARCHAR(20),              -- "Timetable generated: dd-mm-yyyy" in the PDF
+    page_count INT,
+    team_hash CHAR(64),                    -- team list used for this parse (re-parse when it changes)
+    teacher_names JSONB,                   -- every teacher name in the PDF headers
+    unmatched JSONB,                       -- team members whose name was not found in the PDF
+    is_active BOOLEAN NOT NULL DEFAULT FALSE,
+    parsed_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS timetable_entries (
+    id SERIAL PRIMARY KEY,
+    timetable_id INT NOT NULL REFERENCES timetables(id) ON DELETE CASCADE,
+    email VARCHAR(150) NOT NULL,           -- team member (matched by the name on the PDF page)
+    teacher_name VARCHAR(100) NOT NULL,    -- name as written in the PDF
+    day_of_week VARCHAR(4) NOT NULL,       -- Mo, Tu, We, Th, Fr, Sa
+    slots INT[] NOT NULL,                  -- e.g. {1,2} for a two-slot lecture
+    course_code VARCHAR(100),
+    venue VARCHAR(100),
+    class_name VARCHAR(100)
+);
+CREATE INDEX IF NOT EXISTS timetable_entries_tt_email_idx ON timetable_entries(timetable_id, email);

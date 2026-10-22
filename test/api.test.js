@@ -102,6 +102,7 @@ before(async () => {
       driveKey: 'AIzaTESTKEYTESTKEYTESTKEYTEST',
       driveFolderId: 'folder123',
       rateLimits: false,
+      autoTimetable: false,
     },
   });
 });
@@ -437,5 +438,192 @@ describe('teams, keys and errors', () => {
       .set('Content-Type', 'application/json')
       .send(JSON.stringify({ pad: 'x'.repeat(1_200_000) }));
     assert.equal(big.status, 413);
+  });
+});
+
+describe('timetable read on the server', () => {
+  const samplePdf = fs.readFileSync(path.join(__dirname, 'fixtures', 'timetable_sample.pdf'));
+  let drive; // what the fake Drive folder holds
+  let downloads = 0;
+  async function ttFetch(url) {
+    if (url.includes('/drive/v3/files?')) {
+      return { ok: true, status: 200, json: async () => ({ files: drive }) };
+    }
+    const m = /\/drive\/v3\/files\/([A-Za-z0-9_-]+)\?alt=media/.exec(url);
+    if (m && drive.some((f) => f.id === m[1])) {
+      downloads += 1;
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: () => String(samplePdf.length) },
+        arrayBuffer: async () => samplePdf.buffer.slice(samplePdf.byteOffset, samplePdf.byteOffset + samplePdf.length),
+      };
+    }
+    return { ok: false, status: 404, json: async () => ({}) };
+  }
+  let ttApp;
+  let trainerToken;
+
+  before(async () => {
+    drive = [{ id: 'TTFILE000001', name: 'Teacher Wise 12.10.2026.pdf', modifiedTime: '2026-10-10T10:00:00Z' }];
+    ttApp = createApp({
+      db: pool, push: fakePush, fetch: ttFetch, verifyGoogleIdToken: fakeVerify,
+      config: {
+        googleClientIds: `${APP_CLIENT},${LAS_CLIENT}`, timeZone: TZ, rateLimits: false, autoTimetable: false,
+        driveKey: 'AIzaTESTKEYTESTKEYTESTKEYTEST', driveFolderId: 'folder123',
+      },
+    });
+    await pool.query(
+      `INSERT INTO team_members (email, name, name_key, role, active) VALUES
+       ('asha.verma@cqst.in', 'Asha Verma', 'asha verma', 'TRAINER', TRUE),
+       ('ravi.kumar@cqst.in', 'Mr. Ravi Kumar', 'ravi kumar', 'TRAINER', TRUE),
+       ('not.inpdf@cqst.in', 'Nobody Here', 'nobody here', 'TRAINER', TRUE)
+       ON CONFLICT (email) DO UPDATE SET active = TRUE`
+    );
+    const r = await request(ttApp)
+      .post('/api/auth/google')
+      .send({ client: 'app', idToken: gtok('asha.verma@cqst.in'), fcmToken: 'tok-asha' });
+    assert.equal(r.status, 200);
+    trainerToken = r.body.token;
+  });
+
+  after(async () => {
+    await pool.query("DELETE FROM sessions WHERE email IN ('asha.verma@cqst.in','ravi.kumar@cqst.in','not.inpdf@cqst.in')");
+    await pool.query("DELETE FROM team_members WHERE email IN ('asha.verma@cqst.in','ravi.kumar@cqst.in','not.inpdf@cqst.in')");
+    await pool.query('DELETE FROM timetables');
+  });
+
+  test('only managers can refresh or read the team timetable', async () => {
+    assert.equal((await request(ttApp).post('/api/las/timetable/refresh')).status, 401);
+    assert.equal((await request(ttApp).post('/api/las/timetable/refresh').set(auth(trainerToken))).status, 401);
+    assert.equal((await request(ttApp).get('/api/las/timetable').set(auth(trainerToken))).status, 401);
+    assert.equal((await request(ttApp).get('/api/timetable/mine')).status, 401);
+  });
+
+  test('parses only team pages, merged cells and half rows exactly', async () => {
+    const r = await request(ttApp).post('/api/las/timetable/refresh').set(auth(T.las)).send({});
+    assert.equal(r.status, 200, JSON.stringify(r.body));
+    assert.equal(r.body.status, 'updated');
+    assert.equal(r.body.pages, 3);
+    assert.equal(r.body.teachersMatched, 2);
+    assert.ok(r.body.unmatched.includes('Nobody Here'));
+    assert.ok(!r.body.unmatched.includes('Asha Verma') && !r.body.unmatched.includes('Mr. Ravi Kumar'));
+
+    const tt = await request(ttApp).get('/api/las/timetable').set(auth(T.las));
+    assert.equal(tt.status, 200);
+    assert.equal(tt.body.timetable.effectiveFrom, '2026-10-12');
+    assert.equal(tt.body.timetable.generatedOn, '2026-07-10');
+    assert.deepEqual(tt.body.teachers, ['Ms Asha Verma', 'Mr Outside Person', 'Dr. Ravi Kumar']);
+    assert.ok(!tt.body.lectures.some((l) => l.teacher === 'Mr Outside Person'), 'pages outside the team are not parsed');
+    const asha = tt.body.lectures.filter((l) => l.email === 'asha.verma@cqst.in');
+    assert.deepEqual(
+      asha.map((l) => [l.day, l.slots.join(','), l.courseCode, l.venue, l.className]),
+      [
+        ['Mo', '5', 'PA', 'CVR303R', 'BE-CSE-5F'],
+        ['Mo', '7,8', 'PA', 'CVR308R', 'BE-CSE-5G'],
+        ['We', '1,2', 'PA', 'RJ309R', 'BE-CSE-5E'],
+      ]
+    );
+    const ravi = tt.body.lectures.filter((l) => l.email === 'ravi.kumar@cqst.in');
+    assert.deepEqual(
+      ravi.map((l) => [l.day, l.slots.join(','), l.courseCode, l.className]),
+      [
+        ['Tu', '1,2,3,4', 'Bio chem P', 'BP-2B Group 1'],
+        ['Tu', '2', 'HDT-T', 'BP-6A'],
+        ['Tu', '6', 'HDT-T', 'BP-6A'],
+        ['Th', '5,6,7,8', 'DSL', 'BE-CSE-4C Group 2'],
+      ]
+    );
+  });
+
+  test('a trainer sees only their own lectures', async () => {
+    const r = await request(ttApp).get('/api/timetable/mine').set(auth(trainerToken));
+    assert.equal(r.status, 200);
+    assert.equal(r.body.lectures.length, 3);
+    assert.ok(!JSON.stringify(r.body).includes('ravi'));
+    assert.ok(!('email' in r.body.lectures[0]));
+  });
+
+  test('first timetable: only trainers with lectures get a TIMETABLE_UPDATED push', async () => {
+    await new Promise((res) => setTimeout(res, 50));
+    const pushes = sent.filter((p) => p.data.type === 'TIMETABLE_UPDATED');
+    assert.deepEqual(pushes.map((p) => p.token), ['tok-asha']);
+    assert.ok(!JSON.stringify(pushes).includes('CVR'), 'push carries no lecture data');
+  });
+
+  test('phone cache: same version answers "unchanged" with no lectures', async () => {
+    const full = await request(ttApp).get('/api/timetable/mine').set(auth(trainerToken));
+    assert.equal(full.body.changed, true);
+    assert.match(full.body.version, /^[0-9a-f]{32}$/);
+    const same = await request(ttApp).get('/api/timetable/mine').query({ known: full.body.version }).set(auth(trainerToken));
+    assert.equal(same.status, 200);
+    assert.deepEqual(same.body, { changed: false, version: full.body.version });
+    const old = await request(ttApp).get('/api/timetable/mine').query({ known: '0'.repeat(32) }).set(auth(trainerToken));
+    assert.equal(old.body.changed, true);
+    assert.equal(old.body.lectures.length, 3);
+    const junk = await request(ttApp).get('/api/timetable/mine?known=%27%3BDROP').set(auth(trainerToken));
+    assert.equal(junk.status, 200);
+    assert.equal(junk.body.changed, true);
+  });
+
+  test('same file and same team: nothing is downloaded again', async () => {
+    const before = downloads;
+    const r = await request(ttApp).post('/api/las/timetable/refresh').set(auth(T.las)).send({});
+    assert.equal(r.body.status, 'unchanged');
+    assert.equal(downloads, before);
+  });
+
+  test('a team change or a new upload is picked up', async () => {
+    await pool.query("UPDATE team_members SET active = FALSE WHERE email = 'not.inpdf@cqst.in'");
+    let r = await request(ttApp).post('/api/las/timetable/refresh').set(auth(T.las)).send({});
+    assert.equal(r.body.status, 'updated');
+    assert.ok(!r.body.unmatched.includes('Nobody Here'));
+    drive = [{ id: 'TTFILE000002', name: 'Teacher Wise new.pdf', modifiedTime: '2026-10-20T10:00:00Z' }, ...drive];
+    r = await request(ttApp).post('/api/las/timetable/refresh').set(auth(T.las)).send({});
+    assert.equal(r.body.status, 'updated');
+    const tt = await request(ttApp).get('/api/las/timetable').set(auth(T.las));
+    assert.equal(tt.body.timetable.fileName, 'Teacher Wise new.pdf');
+    const kept = await pool.query('SELECT COUNT(*)::int AS n FROM timetables');
+    assert.ok(kept.rows[0].n <= 3, 'old timetables are trimmed');
+    const active = await pool.query('SELECT COUNT(*)::int AS n FROM timetables WHERE is_active');
+    assert.equal(active.rows[0].n, 1);
+  });
+
+  test('a new file with the same lectures sends no push; the version follows the file', async () => {
+    const v1 = (await request(ttApp).get('/api/timetable/mine').set(auth(trainerToken))).body.version;
+    sent.length = 0;
+    drive = [{ id: 'TTFILE000004', name: 'Teacher Wise 26.10.2026.pdf', modifiedTime: '2026-10-25T10:00:00Z' }, ...drive];
+    const r = await request(ttApp).post('/api/las/timetable/refresh').set(auth(T.las)).send({});
+    assert.equal(r.body.status, 'updated');
+    assert.equal(r.body.trainersChanged, 0);
+    await new Promise((res) => setTimeout(res, 50));
+    assert.equal(sent.filter((p) => p.data.type === 'TIMETABLE_UPDATED').length, 0);
+    const v2 = (await request(ttApp).get('/api/timetable/mine').set(auth(trainerToken))).body.version;
+    assert.notEqual(v1, v2, 'new effective date = new version, so the phone shows the right date');
+  });
+
+  test('public cron ping takes no input, returns no data and is throttled', async () => {
+    const first = await request(ttApp).post('/api/timetable/refresh');
+    assert.equal(first.status, 202);
+    assert.deepEqual(Object.keys(first.body), ['status']);
+    const second = await request(ttApp).post('/api/timetable/refresh');
+    assert.ok(['busy', 'recent'].includes(second.body.status));
+    await new Promise((res) => setTimeout(res, 300));
+  });
+
+  test('a file that is not a PDF is refused and the old timetable stays', async () => {
+    const bad = createApp({
+      db: pool, push: fakePush, verifyGoogleIdToken: fakeVerify,
+      fetch: async (url) =>
+        url.includes('/drive/v3/files?')
+          ? { ok: true, status: 200, json: async () => ({ files: [{ id: 'TTFILE000003', name: 'x.pdf', modifiedTime: 'z' }] }) }
+          : { ok: true, status: 200, headers: { get: () => '10' }, arrayBuffer: async () => new ArrayBuffer(10) },
+      config: { googleClientIds: `${APP_CLIENT},${LAS_CLIENT}`, rateLimits: false, autoTimetable: false, driveKey: 'k', driveFolderId: 'f' },
+    });
+    const r = await request(bad).post('/api/las/timetable/refresh').set(auth(T.las)).send({});
+    assert.equal(r.status, 502);
+    assert.equal(r.body.error, 'Not a PDF');
+    const tt = await request(ttApp).get('/api/las/timetable').set(auth(T.las));
+    assert.equal(tt.body.timetable.fileName, 'Teacher Wise 26.10.2026.pdf');
   });
 });
